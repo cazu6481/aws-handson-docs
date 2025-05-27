@@ -1,0 +1,2015 @@
+# クロスアカウントネットワークアーキテクチャ設計（120アカウント対応）
+
+セキュアハイブリッド・クロスアカウントネットワーク構成：
+
+TechNova社の120アカウント構成において、オンプレミス統合、20マイクロサービス間通信、グローバルDNS統合、パフォーマンス最適化、包括的監視を実現する完全なネットワーク基盤を構築します。
+
+## 1. アカウント・ネットワーク対応関係（120アカウント完全版）
+
+### 1.1 組織階層とネットワーク構成
+
+#### 1.1.1 Root Management Account (AWS Organizations Root)
+```
+└── VPC: なし（請求・組織管理のみ）
+```
+- **設計理由**: Root Accountはセキュリティベストプラクティスに従い、ネットワークリソースを持たない最小権限構成とします。これにより、組織全体の管理機能と実際のワークロードを分離し、セキュリティリスクを最小化します。
+
+#### 1.1.2 Security Account (セキュリティ統合管理)
+```
+├── VPC: 10.200.0.0/16 (Security Operations Center)
+├── Subnets:
+│   ├── Public: 10.200.1.0/24, 10.200.2.0/24 (管理アクセス)
+│   ├── Private: 10.200.10.0/24, 10.200.11.0/24 (SIEM, SOC)
+│   └── Endpoints: 10.200.20.0/24, 10.200.21.0/24
+├── Services: Security Hub, GuardDuty, Config統合
+└── Cross-Account Role: 全120アカウントからのログ・監査データ受信
+```
+
+**VPC CIDR設計**:
+- **10.200.0.0/16**: セキュリティ監視・監査用の独立したCIDRブロックを割り当て、他のワークロードVPCと明確に分離します。/16のサイズは将来的なセキュリティツールの拡張に対応可能な十分な容量を確保しています。
+
+**Subnet構成の詳細**:
+- **Public Subnets (10.200.1.0/24, 10.200.2.0/24)**
+  - **目的**: セキュリティ管理者の安全なリモートアクセスとSSL VPN接続を提供
+  - **設計メリット**: Multi-AZ配置により高可用性を確保し、単一AZ障害時でも管理アクセスを維持
+- **Private Subnets (10.200.10.0/24, 10.200.11.0/24)**
+  - **目的**: SIEM（Security Information and Event Management）システムとSOC（Security Operations Center）ツールを隔離された環境で運用
+  - **実装効果**: 収集したセキュリティデータを外部からアクセス不可能な環境で保護
+- **Endpoint Subnets (10.200.20.0/24, 10.200.21.0/24)**
+  - **目的**: VPC Endpointを専用サブネットに配置することで、ネットワークトラフィックの分離と管理を容易化
+  - **コスト削減**: エンドポイントの集約管理により、個別配置と比較して月額コストを約40%削減
+
+**サービス構成と選定理由**:
+- **Security Hub統合**
+  - **選定理由**: 120アカウント全体のセキュリティ状況を一元的に可視化し、コンプライアンススコアの自動評価を実現
+  - **代替案との比較**: サードパーティSIEMと比較して、AWS環境との深い統合により設定工数を80%削減
+- **GuardDuty**
+  - **選定理由**: 機械学習ベースの脅威検知により、従来型のルールベース検知では発見困難な攻撃を検出
+  - **実装メリット**: 各アカウントで個別に脅威検知を行う場合と比較して、管理工数を95%削減
+- **Config統合**
+  - **選定理由**: 全アカウントのリソース設定変更を追跡し、コンプライアンス違反を自動検出
+  - **監査対応**: 設定変更の完全な監査証跡により、内部監査・外部監査への対応時間を70%短縮
+
+#### 1.1.3 Shared Services Account (共通インフラ統合)
+```
+├── VPC: 10.100.0.0/16 (Shared Infrastructure Hub)
+├── Subnets:
+│   ├── Public: 10.100.1.0/24, 10.100.2.0/24 (ALB, CloudFront Origin)
+│   ├── Private: 10.100.10.0/24, 10.100.11.0/24 (ECR, DNS)
+│   ├── Database: 10.100.20.0/24, 10.100.21.0/24 (共通DB)
+│   └── Endpoints: 10.100.30.0/24, 10.100.31.0/24
+├── Services:
+│   ├── ECR: 全20サービス用コンテナレジストリ
+│   ├── Route 53: Public/Private Hosted Zones
+│   ├── Certificate Manager: SSL/TLS証明書統合管理
+│   └── Parameter Store: 設定情報統合管理
+└── RAM共有: VPC Endpoints, Route 53 Resolver Rules
+```
+
+**VPC CIDR設計**:
+- **10.100.0.0/16**: 全アカウントで共有するインフラストラクチャサービスを集約し、重複投資を避けながら管理を簡素化
+
+**Subnet設計の詳細と理由**:
+- **Public Subnets (10.100.1.0/24, 10.100.2.0/24)**
+  - **ALB配置理由**: インターネット向けロードバランサーを集約し、SSL証明書管理とWAF適用を一元化
+  - **CloudFront Origin**: 静的コンテンツ配信のオリジンサーバーを配置し、グローバル配信を最適化
+- **Private Subnets (10.100.10.0/24, 10.100.11.0/24)**
+  - **ECR配置**: コンテナイメージを中央管理し、脆弱性スキャンとイメージ署名を統合実施
+  - **DNS配置**: Route 53 Resolverエンドポイントにより、ハイブリッドDNS解決を実現
+- **Database Subnets (10.100.20.0/24, 10.100.21.0/24)**
+  - **共通DB用途**: 全サービスで参照するマスターデータ（製品マスター、顧客マスター等）を管理
+  - **分離理由**: データベース層を独立したサブネットに配置し、アプリケーション層からのアクセスを制御
+- **Endpoint Subnets (10.100.30.0/24, 10.100.31.0/24)**
+  - **集約効果**: 120アカウント分のVPC Endpointを共有することで、月額約300万円のコスト削減
+  - **管理効率**: エンドポイントポリシーの一元管理により、セキュリティポリシーの一貫性を確保
+
+**サービス構成の詳細設計**:
+- **ECR (Elastic Container Registry)**
+  - **容量設計**: 20サービス × 5環境 × 10世代 = 1,000イメージの保存に対応
+  - **スキャン戦略**: プッシュ時自動スキャン + 日次定期スキャンによる継続的な脆弱性管理
+  - **レプリケーション**: 大阪リージョンへの自動レプリケーションによりDR対応
+- **Route 53統合管理**
+  - **Public Hosted Zones**: technova.com（インターネット向けDNS）
+  - **Private Hosted Zones**: technova.internal（内部サービス向けDNS）
+  - **分離効果**: 内部・外部DNSの明確な分離により、情報漏洩リスクを低減
+- **Certificate Manager**
+  - **証明書種別**: ワイルドカード証明書（*.technova.com）による効率的な管理
+  - **自動更新**: 有効期限30日前の自動更新により、証明書切れによるサービス停止を防止
+- **Parameter Store**
+  - **階層構造**: /technova/環境/サービス/パラメータ名 の命名規則で体系的に管理
+  - **暗号化**: KMSによる暗号化で機密情報（DBパスワード、APIキー等）を保護
+
+#### 1.1.4 Network Hub Account (ネットワーク中央管理)
+```
+├── VPC: 10.150.0.0/16 (Network Operations Center)
+├── Subnets:
+│   ├── Public: 10.150.1.0/24, 10.150.2.0/24 (NAT Gateway, VPN)
+│   ├── Transit GW: 10.150.10.0/24, 10.150.11.0/24 (TGW Attachments)
+│   ├── Resolver: 10.150.20.0/24, 10.150.21.0/24 (DNS Endpoints)
+│   └── DirectConnect: 10.150.30.0/24, 10.150.31.0/24 (DX接続)
+├── Services:
+│   ├── Transit Gateway: 全120アカウント接続ハブ
+│   ├── DirectConnect Gateway: オンプレミス接続
+│   ├── Site-to-Site VPN: バックアップ接続
+│   └── Route 53 Resolver: ハイブリッドDNS統合
+└── Network Monitoring: 全アカウント通信監視
+```
+
+**VPC CIDR設計理由**:
+- **10.150.0.0/16**: ネットワーク管理専用の独立したアドレス空間を確保し、ワークロードVPCとの明確な分離を実現
+
+**Subnet設計の詳細**:
+- **Public Subnets (10.150.1.0/24, 10.150.2.0/24)**
+  - **NAT Gateway**: プライベートサブネットからのインターネット向け通信を集約管理
+  - **VPN Endpoints**: Site-to-Site VPNの終端点として、DirectConnect障害時のフェイルオーバーを提供
+  - **高可用性設計**: 各AZにNAT GatewayとVPN Endpointを配置し、AZ障害に対する耐性を確保
+- **Transit Gateway Subnets (10.150.10.0/24, 10.150.11.0/24)**
+  - **専用サブネット理由**: TGW ENIを独立したサブネットに配置し、ルーティング制御を簡素化
+  - **容量設計**: /24サブネットにより、将来的な接続数増加にも対応可能
+- **Resolver Subnets (10.150.20.0/24, 10.150.21.0/24)**
+  - **Inbound Endpoints**: オンプレミスからAWSリソースの名前解決を可能に
+  - **Outbound Endpoints**: AWSからオンプレミスリソースの名前解決を可能に
+  - **冗長性**: 各AZに配置し、DNS解決の高可用性を確保
+- **DirectConnect Subnets (10.150.30.0/24, 10.150.31.0/24)**
+  - **専用線終端**: DirectConnect仮想インターフェース（VIF）の接続点
+  - **分離理由**: 専用線トラフィックを他のトラフィックから物理的に分離
+
+**サービス構成の選定理由と設計詳細**:
+- **Transit Gateway**
+  - **選定理由**: VPC Peeringのフルメッシュ構成（120×119÷2=7,140接続）を回避
+  - **設計メリット**: ハブ&スポーク型により接続数を120に削減、管理工数を99%削減
+  - **拡張性**: 最大5,000 VPC接続可能で、将来の成長に対応
+- **DirectConnect Gateway**
+  - **帯域設計**: 2Gbps × 2（東京）、1Gbps × 2（大阪）の冗長構成
+  - **選定理由**: オンプレミスとの大容量データ転送（日次1.5TB）に対応
+  - **SLA**: 99.99%の可用性を保証し、ビジネスクリティカルな通信を支える
+- **Site-to-Site VPN**
+  - **構成**: 4トンネル（2 × 2 Customer Gateway）による高可用性
+  - **用途**: DirectConnect障害時の自動フェイルオーバー
+  - **暗号化**: AES-256、SHA-256、DH Group 14による強固なセキュリティ
+- **Route 53 Resolver**
+  - **統合効果**: オンプレミスActive DirectoryとAWS内部DNSのシームレスな統合
+  - **クエリ転送**: 条件付きフォワーダーにより、ドメイン別に適切なDNSサーバーへ転送
+
+### 1.2 事業部門別アカウント構成（96アカウント）
+
+#### 1.2.1 製造部門（Manufacturing - 24アカウント）
+
+##### Development Environment (6アカウント)
+```
+│ technova-mfg-dev-app → VPC: 10.0.0.0/16
+│ technova-mfg-dev-db → VPC: 10.0.1.0/16
+│ technova-mfg-dev-api → VPC: 10.0.2.0/16
+│ technova-mfg-dev-batch → VPC: 10.0.3.0/16
+│ technova-mfg-dev-monitor → VPC: 10.0.4.0/16
+│ technova-mfg-dev-network → VPC: 10.0.5.0/16
+```
+- **アカウント分割理由**: 開発チーム間の権限分離と、リソース利用の明確化により、コスト管理と障害影響の局所化を実現
+- **CIDR設計**: 連続したアドレス空間により、集約ルーティングを可能にし、ルートテーブルのエントリー数を削減
+
+##### Test Environment (6アカウント)
+```
+│ technova-mfg-test-* → VPC: 10.0.10-15.0/16
+```
+- **環境分離理由**: テスト環境を本番環境と同じ構成にすることで、環境差異による本番障害を防止
+- **自動化対応**: CloudFormationテンプレートの再利用により、環境構築時間を90%短縮
+
+##### Staging Environment (6アカウント)
+```
+│ technova-mfg-staging-* → VPC: 10.0.20-25.0/16
+```
+- **Staging必要性**: 本番と完全同等の環境でパフォーマンステストと最終検証を実施
+- **データ同期**: 本番データの匿名化コピーを日次で同期し、リアルなテストを可能に
+
+##### Production Environment (6アカウント)
+```
+│ technova-mfg-prod-* → VPC: 10.0.30-35.0/16
+```
+- **本番分離設計**: アプリケーション、データベース、API、バッチ、監視、ネットワークを独立アカウントで管理
+- **障害影響限定**: 各機能を分離することで、障害時の影響範囲を最小化
+
+#### 1.2.2 販売部門（Sales - 24アカウント）
+- **VPC CIDR範囲**: 10.1.0.0/16 〜 10.1.35.0/16
+- **構成**: 製造部門と同様の4環境×6アカウント構成
+- **特有の要件**: B2C向けWebアプリケーションのため、CloudFrontとの統合を重視した設計
+
+#### 1.2.3 保守サービス部門（Service - 24アカウント）
+- **VPC CIDR範囲**: 10.2.0.0/16 〜 10.2.35.0/16
+- **構成**: 製造部門と同様の4環境×6アカウント構成
+- **特有の要件**: 24時間365日稼働のため、メンテナンスウィンドウを考慮した冗長設計
+
+#### 1.2.4 IoT部門（IoT - 24アカウント）
+- **VPC CIDR範囲**: 10.3.0.0/16 〜 10.3.35.0/16
+- **構成**: 製造部門と同様の4環境×6アカウント構成
+- **特有の要件**: 大量のIoTデバイス（7,800台）からのデータ収集に対応した高スループット設計
+
+## 2. Transit Gateway統合アーキテクチャ（RAM完全統合）
+
+### 2.1 Transit Gateway中央集権管理
+
+#### 2.1.1 Network Hub Account内のTransit Gateway
+```
+tgw-technova-main (ap-northeast-1)
+├── 最大接続数: 5,000 VPC (120アカウント対応十分)
+├── 帯域幅: 50Gbps (全アカウント対応)
+├── BGP ASN: 64512 (プライベートASN)
+├── Default Route Table: 無効化（セキュリティ強化）
+└── ECMP: 有効（冗長化・負荷分散）
+```
+
+**設計パラメータの詳細**:
+- **最大接続数: 5,000 VPC**
+  - **現在の使用率**: 120/5,000 = 2.4%
+  - **拡張余地**: 将来的な事業拡大やM&Aにも十分対応可能
+- **帯域幅: 50Gbps**
+  - **算出根拠**: ピーク時トラフィック分析に基づき、現在の最大利用帯域（15Gbps）の3倍以上を確保
+  - **トラフィック内訳**: East-West（サービス間）: 70%、North-South（インターネット向け）: 30%
+- **BGP ASN: 64512**
+  - **選定理由**: プライベートASN範囲（64512-65534）を使用し、将来的な外部接続時のASN競合を回避
+- **Default Route Table無効化**
+  - **セキュリティ効果**: 意図しない通信を防止し、すべての通信を明示的に許可する設計
+  - **運用メリット**: トラブルシューティング時に通信経路を明確に追跡可能
+- **ECMP有効化**
+  - **負荷分散効果**: 同一コストの複数パスを活用し、帯域幅を最大限活用
+  - **障害対応**: パス障害時の自動切り替えにより、サービス継続性を確保
+
+### 2.2 RAM (Resource Access Manager) 完全統合
+
+#### 2.2.1 共有リソース設定
+```
+┌─ 共有リソース ─┐
+│ • Transit Gateway: tgw-technova-main           │
+│ • Route 53 Resolver Rules (全20個)             │
+│ • VPC Endpoints (S3, ECR, Secrets Manager等)   │
+│ • Network ACL Templates                        │
+└────────────────────────────────────────────────┘
+```
+
+**共有リソースの詳細と選定理由**:
+- **Transit Gateway共有**
+  - **コスト削減効果**: 各アカウントで個別作成した場合と比較して、月額約480万円削減
+  - **管理効率**: 中央管理により、ルーティング設定の一貫性を保証
+- **Route 53 Resolver Rules（20個）**
+  - **ルール内訳**: オンプレミスドメイン用（5個）、各部門専用ドメイン用（4個）、共通サービス用（11個）
+  - **共有効果**: DNS設定の重複を排除し、名前解決の一貫性を確保
+- **VPC Endpoints共有**
+  - **対象サービス**: S3、ECR、Secrets Manager、Systems Manager、CloudWatch Logs
+  - **コスト削減**: エンドポイント時間料金を120アカウントで分割、月額約300万円削減
+- **Network ACL Templates**
+  - **標準化効果**: セキュリティポリシーの一貫性を保証し、監査対応を簡素化
+  - **テンプレート種別**: DMZ用、内部サービス用、データベース用、管理用の4種類
+
+#### 2.2.2 共有戦略
+```
+┌─ 共有戦略 ─┐
+│ Organizational Unit単位での共有:                │
+│ • Root OU → Security, Shared Services, Network │
+│ • Manufacturing OU → 製造24アカウント          │
+│ • Sales OU → 販売24アカウント                  │
+│ • Service OU → サービス24アカウント            │
+│ • IoT OU → IoT24アカウント                    │
+└─────────────────────────────────────────────┘
+```
+
+**OU単位共有の設計理由**:
+- **Root OU → 管理系3アカウント**
+  - **権限設計**: 組織全体の管理に必要な包括的アクセス権を付与
+  - **監査対応**: 全リソースへのアクセスログを中央収集
+- **部門別OU → 各24アカウント**
+  - **分離効果**: 部門間の適切な分離を維持しながら、部門内での柔軟な連携を実現
+  - **スケーラビリティ**: 新規アカウント追加時も自動的に共有設定が適用
+
+### 2.3 VPC Attachment完全マップ
+
+#### 2.3.1 製造部門本番アプリアカウントの詳細
+```
+vpc-attachment-mfg-prod-app
+├── Account ID: 123456789012 (technova-mfg-prod-app)
+├── VPC ID: vpc-0abc123def456789a (10.0.30.0/16)
+├── Attachment Subnets:
+│   ├── 10.0.30.200/28 (AZ-1a) - TGW専用
+│   └── 10.0.30.216/28 (AZ-1c) - TGW専用
+├── Route Table Association: manufacturing-prod-rt
+├── Route Propagation: 有効
+└── Tags: {"Department": "Manufacturing", "Environment": "prod"}
+```
+
+**Attachment設計の詳細**:
+- **専用サブネット（/28）使用理由**
+  - **IPアドレス効率**: 各サブネットで14個のIPアドレスを提供（AWS予約分を除く）
+  - **将来拡張**: Transit Gateway接続数が増えても十分対応可能
+- **Multi-AZ配置の効果**
+  - **可用性**: 単一AZ障害時でも通信継続可能
+  - **パフォーマンス**: AZ間でトラフィックを分散し、遅延を最小化
+- **タグ戦略**
+  - **自動化対応**: タグベースでRoute Table関連付けを自動化
+  - **コスト配分**: 部門・環境別のネットワークコストを正確に追跡
+
+#### 2.3.2 全120アカウントのAttachment設計パターン
+各アカウントで同様の設計パターンを適用：
+- **Attachment Subnet**: 各VPCの最後の/28を2つ確保
+- **命名規則**: vpc-attachment-{部門}-{環境}-{機能}
+- **自動化**: CloudFormation StackSetsで一括デプロイ
+
+## 3. 高度なRoute Table設計（セキュリティ分離）
+
+### 3.1 Route Table完全分離戦略
+
+#### 3.1.1 製造部門本番用Route Table
+```
+manufacturing-prod-rt
+├── Associated VPCs (6個):
+│   ├── 10.0.30.0/16 (mfg-prod-app)
+│   ├── 10.0.31.0/16 (mfg-prod-db)
+│   ├── 10.0.32.0/16 (mfg-prod-api)
+│   ├── 10.0.33.0/16 (mfg-prod-batch)
+│   ├── 10.0.34.0/16 (mfg-prod-monitor)
+│   └── 10.0.35.0/16 (mfg-prod-network)
+├── Static Routes:
+│   ├── 10.100.0.0/16 → Shared Services (共通サービス)
+│   ├── 10.1.30.0/20 → Sales Prod APIs (制限的アクセス)
+│   ├── 10.200.0.0/16 → Security Account (監査)
+│   └── 192.168.0.0/16 → On-Premises (ハイブリッド)
+├── Blackhole Routes (セキュリティ):
+│   ├── 10.0.0.0/20 → Dev環境への本番アクセス禁止
+│   ├── 10.0.10.0/20 → Test環境への本番アクセス禁止
+│   └── 10.0.20.0/20 → Staging以外の環境アクセス禁止
+└── Route Propagation Rules:
+    ├── Accept: 同一部門・同一環境
+    ├── Conditional: クロス部門API (ホワイトリスト)
+    └── Deny: その他全て
+```
+
+**Static Routes設計の詳細**:
+- **10.100.0.0/16 → Shared Services**
+  - **通信内容**: ECRからのイメージpull、Parameter Storeからの設定取得、認証サービスへのアクセス
+  - **帯域制御**: QoSポリシーにより共通サービスへのアクセスを優先度「High」に設定
+- **10.1.30.0/20 → Sales Prod APIs**
+  - **制限内容**: 特定のAPIエンドポイント（/inventory、/pricing）のみ許可
+  - **認証要件**: mTLS証明書による相互認証を必須化
+- **10.200.0.0/16 → Security Account**
+  - **通信種別**: CloudWatch Logs、VPC Flow Logs、Config変更通知
+  - **暗号化**: TLS 1.2以上での暗号化を強制
+- **192.168.0.0/16 → On-Premises**
+  - **用途**: レガシーシステムとのデータ連携、Active Directory認証
+  - **帯域保証**: 最低保証帯域500Mbpsを設定
+
+**Blackhole Routes設計理由**:
+- **環境間アクセス制御**
+  - **実装効果**: 本番データの開発・テスト環境への流出を完全にブロック
+  - **監査対応**: ルートテーブルレベルでの制御により、監査証跡を明確化
+- **Staging例外設定**
+  - **許可理由**: 本番デプロイ前の最終検証のため、Stagingとの通信のみ許可
+  - **制御方法**: Security Groupで更に詳細なポート制御を実施
+
+**Route Propagation Rules詳細**:
+- **Accept条件**
+  - **同一部門・同一環境**: 例：manufacturing-prod-app ↔ manufacturing-prod-db
+  - **自動伝播**: BGPによる動的ルート広告を受け入れ
+- **Conditional条件**
+  - **API Gateway経由**: 部門間通信は必ずAPI Gatewayを経由
+  - **Rate Limiting**: 1分あたり1000リクエストの制限
+- **Deny条件**
+  - **デフォルト動作**: 明示的に許可されていない通信はすべて拒否
+  - **ログ記録**: 拒否された通信はすべてログに記録
+
+#### 3.1.2 クロス部門API専用Route Table
+```
+cross-department-api-rt
+├── Purpose: 部門間の制限的API通信
+├── Associated VPCs:
+│   ├── API Accounts only (各部門のAPI account)
+│   └── 最小権限の原則適用
+├── Allowed Routes:
+│   ├── manufacturing-api → sales-api (受注連携)
+│   ├── sales-api → manufacturing-api (在庫確認)
+│   ├── service-api → iot-api (保守データ連携)
+│   └── all-api → common-api (認証・通知)
+├── Security Controls:
+│   ├── Time-based Access (営業時間のみ)
+│   ├── Rate Limiting (API Gateway統合)
+│   └── Audit Logging (全通信記録)
+└── Monitoring:
+    ├── Real-time Traffic Analysis
+    ├── Anomaly Detection
+    └── Security Event Correlation
+```
+
+**Allowed Routes詳細設計**:
+- **manufacturing-api → sales-api (受注連携)**
+  - **API仕様**: REST API、JSON形式、最大ペイロード1MB
+  - **SLA**: 99.9%可用性、レスポンスタイム500ms以内
+  - **用途**: 受注情報を製造システムに連携し、生産計画に反映
+- **sales-api → manufacturing-api (在庫確認)**
+  - **リアルタイム要件**: 在庫数の即時確認（キャッシュ不可）
+  - **負荷分散**: 3つのAPIインスタンスでラウンドロビン
+- **service-api → iot-api (保守データ連携)**
+  - **データ量**: 1日あたり約500MB
+  - **バッチ処理**: 15分間隔でのデータ同期
+- **all-api → common-api (認証・通知)**
+  - **認証方式**: OAuth 2.0、JWTトークン
+  - **通知種別**: メール、SMS、プッシュ通知
+
+**Security Controls実装詳細**:
+- **Time-based Access**
+  - **許可時間**: 平日6:00-22:00、土曜6:00-18:00
+  - **例外処理**: 緊急時は承認ワークフローで一時的に許可
+  - **実装方法**: Lambda関数でRoute Tableを動的に更新
+- **Rate Limiting**
+  - **制限値**: バースト2000req、sustained 1000req/min
+  - **超過時動作**: 429 Too Many Requestsを返却
+  - **除外設定**: 特定の管理IPアドレスは制限対象外
+- **Audit Logging**
+  - **記録内容**: タイムスタンプ、送信元/宛先、APIメソッド、レスポンスコード
+  - **保存期間**: 7年間（コンプライアンス要件）
+  - **分析ツール**: Amazon Athenaでのクエリ分析
+
+#### 3.1.3 共通サービス用Route Table
+```
+common-services-rt
+├── Associated VPCs:
+│   ├── 10.100.0.0/16 (Shared Services)
+│   ├── 10.200.0.0/16 (Security)
+│   └── 10.150.0.0/16 (Network Hub)
+├── Inbound Access:
+│   ├── FROM: 全120アカウント
+│   ├── TO: 認証、DNS、ECR、監視サービス
+│   └── Protocol: HTTPS, gRPC, DNS
+├── Security Enhancement:
+│   ├── WAF Integration
+│   ├── DDoS Protection
+│   └── API Rate Limiting
+└── High Availability:
+    ├── Multi-AZ配置
+    ├── Auto Scaling
+    └── Health Check統合
+```
+
+**Inbound Access制御**:
+- **アクセス元制御**
+  - **許可リスト**: 120アカウントのVPC CIDRを明示的に許可
+  - **動的更新**: アカウント追加時に自動的にルール更新
+- **サービス別アクセス制御**
+  - **認証サービス**: ポート443（HTTPS）、mTLS必須
+  - **DNS**: ポート53（UDP/TCP）、DNSSEC対応
+  - **ECR**: ポート443（HTTPS）、IAMロール認証
+  - **監視サービス**: ポート443（HTTPS）、API Key認証
+
+**Security Enhancement詳細**:
+- **WAF Integration**
+  - **ルールセット**: OWASP Top 10対応、カスタムルール50個
+  - **ブロック率**: 悪意のあるリクエストの99.8%をブロック
+  - **False Positive対策**: 機械学習による自動チューニング
+- **DDoS Protection**
+  - **Shield Advanced**: 自動的にDDoS攻撃を検出・緩和
+  - **対応能力**: 最大100Gbpsの攻撃に対応
+  - **SRT対応**: 大規模攻撃時はAWS SRTチームが対応
+- **API Rate Limiting**
+  - **階層制限**: アカウント別、API別、メソッド別の3階層
+  - **動的調整**: 使用パターンに基づく自動調整
+  - **バースト対応**: 短期的なスパイクを許容
+
+**High Availability設計**:
+- **Multi-AZ配置**
+  - **配置パターン**: 最低3AZに分散配置
+  - **データ同期**: AZ間でのリアルタイムレプリケーション
+  - **フェイルオーバー**: 30秒以内の自動切り替え
+- **Auto Scaling**
+  - **スケール基準**: CPU使用率、ネットワークスループット、同時接続数
+  - **スケール速度**: 需要増加から2分以内にスケールアウト
+  - **コスト最適化**: 需要減少時の自動スケールイン
+- **Health Check統合**
+  - **チェック項目**: HTTP(S)エンドポイント、TCPポート、カスタムヘルスチェック
+  - **チェック間隔**: 10秒（通常）、5秒（異常検出時）
+  - **復旧判定**: 2回連続成功で正常判定
+
+#### 3.1.4 管理・運用専用Route Table
+```
+management-rt
+├── Associated VPCs:
+│   ├── Network Hub VPC
+│   ├── Security VPC
+│   └── Management Tool VPCs
+├── Administrative Access:
+│   ├── SSH/RDP: 管理端末からのみ
+│   ├── SNMP: 監視システム用
+│   ├── Backup: バックアップシステム用
+│   └── Patch Management: Systems Manager
+├── Outbound Rules:
+│   ├── 全120アカウントVPCへのアクセス
+│   ├── オンプレミス管理システム連携
+│   └── 外部監視サービス連携
+└── Audit & Compliance:
+    ├── 全アクセスログ記録
+    ├── Privileged Access Management
+    └── Session Recording
+```
+
+**Administrative Access詳細設計**:
+- **SSH/RDP制御**
+  - **接続元制限**: 踏み台サーバー（Bastion Host）経由のみ
+  - **認証方式**: 公開鍵認証 + MFA必須
+  - **セッション管理**: Session Managerによる記録・監査
+- **SNMP設定**
+  - **バージョン**: SNMPv3（暗号化・認証付き）
+  - **コミュニティ**: 読み取り専用、特定の監視サーバーのみ
+  - **MIB**: AWS標準MIB + カスタムMIB
+- **バックアップ通信**
+  - **プロトコル**: AWS Backup APIまたはカスタムエージェント
+  - **帯域制御**: 営業時間外は帯域制限なし、営業時間中は50%制限
+  - **暗号化**: AES-256による転送時暗号化
+- **パッチ管理**
+  - **Systems Manager統合**: Patch Managerによる自動パッチ適用
+  - **メンテナンスウィンドウ**: 毎週日曜日02:00-06:00
+  - **承認フロー**: Critical以外は自動承認、Criticalは手動承認
+
+#### 3.1.5 オンプレミス統合Route Table
+```
+onpremises-integration-rt
+├── DirectConnect Associations:
+│   ├── dx-connection-primary (2Gbps)
+│   ├── dx-connection-secondary (2Gbps)
+│   └── Failover to Site-to-Site VPN
+├── BGP Configuration:
+│   ├── Advertised Networks:
+│   │   ├── 10.0.0.0/8 (全AWS VPC)
+│   │   └── 169.254.169.253/32 (AWS DNS)
+│   ├── Received Networks:
+│   │   ├── 192.168.0.0/16 (On-premises)
+│   │   └── 172.16.0.0/12 (Legacy systems)
+├── Traffic Engineering:
+│   ├── AS-PATH Prepending (トラフィック制御)
+│   ├── MED Attributes (コスト最適化)
+│   └── Community Tags (QoS制御)
+└── Hybrid Services:
+    ├── DNS Resolution (Route 53 ↔ AD)
+    ├── Directory Services (AD Connector)
+    └── File Services (FSx連携)
+```
+
+**DirectConnect構成詳細**:
+- **Primary接続（東京）**
+  - **帯域**: 2Gbps × 2本（Active-Active構成）
+  - **VLAN**: 802.1Q タグVLAN（VLAN ID: 100-199）
+  - **接続先**: 東京データセンター（大手町）
+- **Secondary接続（大阪）**
+  - **帯域**: 2Gbps × 2本（Standby構成）
+  - **用途**: DR用および東京障害時のフェイルオーバー
+  - **切替時間**: BGPによる自動切替で180秒以内
+- **VPNバックアップ**
+  - **構成**: 4本のIPsecトンネル（2 CGW × 2 VGW）
+  - **帯域**: 各トンネル1.25Gbps（合計5Gbps）
+  - **暗号化**: AES-256-GCM、SHA-256、PFS有効
+
+**BGP Configuration詳細**:
+- **Advertised Networks**
+  - **10.0.0.0/8集約広告**
+    - **理由**: 個別VPC広告ではなく集約することで、BGPテーブルサイズを削減
+    - **例外処理**: 特定VPCを広告から除外する場合はBGPフィルター適用
+  - **AWS DNS広告（169.254.169.253/32）**
+    - **目的**: オンプレミスからAWS DNSへの到達性確保
+    - **効果**: VPC内リソースの名前解決を可能に
+- **Received Networks**
+  - **192.168.0.0/16（本社ネットワーク）**
+    - **内容**: オフィス、データセンター、既存システム
+    - **フィルタリング**: 不要なサブネットはBGPフィルターで除外
+  - **172.16.0.0/12（レガシーシステム）**
+    - **移行計画**: 段階的にAWSへ移行予定
+    - **アクセス制御**: 特定のAWSリソースからのみアクセス許可
+
+**Traffic Engineering実装**:
+- **AS-PATH Prepending**
+  - **設定**: バックアップ経路に3回のAS追加
+  - **効果**: プライマリ経路を優先的に使用
+  - **監視**: BGPセッションステータスを常時監視
+- **MED (Multi-Exit Discriminator)**
+  - **プライマリ**: MED値100
+  - **セカンダリ**: MED値200
+  - **用途**: 同一AS内での経路優先度制御
+- **BGP Community Tags**
+  - **65000:100**: プライマリ経路タグ
+  - **65000:200**: バックアップ経路タグ
+  - **65000:666**: Blackhole（DDoS対策用）
+
+**Hybrid Services統合**:
+- **DNS Resolution統合**
+  - **Route 53 → AD**: .localドメインをAD DNSへ転送
+  - **AD → Route 53**: .internal、.amazonaws.comをRoute 53へ転送
+  - **キャッシュ設定**: 300秒（頻繁に変更されるレコード用）
+- **Directory Services (AD Connector)**
+  - **用途**: オンプレミスADを使用したAWSリソース認証
+  - **構成**: Multi-AZ配置で高可用性確保
+  - **同期間隔**: 5分（ユーザー・グループ情報）
+- **File Services (FSx) 連携**
+  - **プロトコル**: SMB 3.1.1（暗号化・署名付き）
+  - **認証**: Kerberos（AD統合）
+  - **容量**: 100TB（自動拡張有効）
+
+## 4. 完全統合DNS設計（グローバル↔AWS↔オンプレミス）
+
+### 4.1 DNS統合アーキテクチャ完全版
+
+#### 4.1.1 Route 53 Public Hosted Zone (グローバルDNS)
+```
+technova.com (Shared Services Account管理)
+├── Authoritative Name Servers:
+│   ├── ns-1234.awsdns-56.com
+│   ├── ns-789.awsdns-01.net
+│   ├── ns-456.awsdns-78.org
+│   └── ns-123.awsdns-90.co.uk
+├── DNSSEC: 有効化（改ざん防止）
+├── Global DNS Records:
+│   ├── www.technova.com → CloudFront (d123456.cloudfront.net)
+│   ├── portal.technova.com → CloudFront (d789012.cloudfront.net)
+│   ├── api.technova.com → API Gateway (api-gw-12345.execute-api.ap-northeast-1.amazonaws.com)
+│   ├── admin.technova.com → ALB (admin-alb-67890.ap-northeast-1.elb.amazonaws.com)
+│   └── aws.technova.com → AWS専用サブドメイン委任
+├── Geo-Location Routing:
+│   ├── Asia-Pacific → ap-northeast-1 (Tokyo)
+│   ├── North America → us-east-1 (Virginia)
+│   └── Europe → eu-west-1 (Ireland)
+├── Health Checks:
+│   ├── Primary: Tokyo Region (30秒間隔)
+│   ├── Secondary: Osaka Region (DR)
+│   └── Failover: 3回失敗で自動切り替え
+└── Traffic Policies:
+    ├── Weighted Routing (Blue/Green Deploy)
+    ├── Latency-based Routing
+    └── Geolocation Routing
+```
+
+**Name Server設計理由**:
+- **4つの異なるTLD配置**
+  - **耐障害性**: 単一TLDの障害に対する耐性確保
+  - **地理的分散**: 各NSは異なる地理的位置に配置
+  - **Anycast対応**: 各NSはAnycastで複数拠点から応答
+
+**DNSSEC実装詳細**:
+- **KSK (Key Signing Key)**: 2048bit RSA、年次ローテーション
+- **ZSK (Zone Signing Key)**: 1024bit RSA、月次ローテーション
+- **DS Record**: 親ゾーン（.com）に登録済み
+- **検証率**: クライアントの約40%がDNSSEC検証を実施
+
+**Global DNS Records詳細設計**:
+- **www.technova.com**
+  - **CloudFront Distribution**: 全世界200+エッジロケーション
+  - **Origin**: 東京リージョンのALB（プライマリ）、大阪（セカンダリ）
+  - **キャッシュ動作**: 静的コンテンツ24時間、動的コンテンツ5分
+- **portal.technova.com**
+  - **用途**: B2C顧客ポータル（11,200ユーザー）
+  - **WAF**: SQLインジェクション、XSS対策ルール適用
+  - **SSL**: SNI対応、TLS 1.2以上のみ許可
+- **api.technova.com**
+  - **API Gateway**: REST API、WebSocket対応
+  - **認証**: API Key、OAuth 2.0、IAM認証の3方式対応
+  - **Rate Limit**: 10,000 req/sec（バースト20,000）
+- **admin.technova.com**
+  - **ALB設定**: 内部管理者用、IPホワイトリスト適用
+  - **セキュリティ**: WAF、Shield Standard適用
+  - **ログ**: 全アクセスログをS3に保存
+
+**Geo-Location Routing詳細**:
+- **判定ロジック**
+  - **1st**: クライアントIPの地理的位置
+  - **2nd**: EDNS Client Subnet対応
+  - **Default**: レイテンシーベースで最適リージョン選択
+- **カスタマイズ**
+  - **中国**: 専用のCDN/ICPライセンス対応
+  - **EU**: GDPR準拠のためEUリージョン固定
+  - **米国政府**: GovCloud利用（将来対応）
+
+**Health Check詳細設定**:
+- **監視対象**
+  - **HTTPS**: /health エンドポイント
+  - **期待値**: HTTPステータス200、レスポンスボディ"OK"
+  - **タイムアウト**: 4秒
+- **監視ロケーション**
+  - **リージョン**: 15リージョンから監視
+  - **判定**: 過半数（8/15）の成功で正常判定
+- **通知設定**
+  - **SNS Topic**: 障害時に運用チームへ通知
+  - **Lambda連携**: 自動復旧処理の起動
+
+#### 4.1.2 Route 53 Private Hosted Zone (AWS内部統合)
+```
+technova.internal (Shared Services Account管理)
+├── VPC Associations (120個):
+│   ├── Cross-Account Association権限設定
+│   ├── 各アカウントVPCとの関連付け
+│   └── 自動更新・同期機能
+├── Service Discovery統合:
+│   ├── manufacturing.technova.internal
+│   │   ├── planning.manufacturing.technova.internal → 10.0.30.100
+│   │   ├── inventory.manufacturing.technova.internal → 10.0.30.101
+│   │   ├── tracking.manufacturing.technova.internal → 10.0.30.102
+│   │   └── material.manufacturing.technova.internal → 10.0.30.103
+│   ├── sales.technova.internal
+│   │   ├── order.sales.technova.internal → 10.1.30.100
+│   │   ├── customer.sales.technova.internal → 10.1.30.101
+│   │   ├── shipping.sales.technova.internal → 10.1.30.102
+│   │   └── billing.sales.technova.internal → 10.1.30.103
+│   ├── service.technova.internal (保守4サービス)
+│   ├── iot.technova.internal (IoT4サービス)
+│   └── common.technova.internal (共通4サービス)
+├── Infrastructure Records:
+│   ├── infra.technova.internal
+│   │   ├── aurora-manufacturing-planning.infra.technova.internal
+│   │   ├── aurora-sales-order.infra.technova.internal
+│   │   └── (全20個のAuroraクラスターエンドポイント)
+│   ├── shared.technova.internal
+│   │   ├── ecr.shared.technova.internal
+│   │   ├── secrets.shared.technova.internal
+│   │   └── parameter-store.shared.technova.internal
+│   └── network.technova.internal
+│       ├── tgw.network.technova.internal
+│       ├── resolver.network.technova.internal
+│       └── dx-gateway.network.technova.internal
+└── Dynamic DNS Updates:
+    ├── ECS Service Connect統合
+    ├── Auto Scaling統合
+    └── Lambda関数による自動更新
+```
+
+**VPC Association管理**:
+- **権限モデル**
+  - **ReadOnly**: 全120アカウント（名前解決のみ）
+  - **ReadWrite**: Shared Services Account（レコード管理）
+- **自動化**
+  - **EventBridge**: アカウント作成イベントでLambda起動
+  - **Lambda処理**: VPC Association自動追加
+  - **通知**: 完了/失敗をSNSで通知
+
+**Service Discovery詳細実装**:
+- **ECS Service Connect統合**
+  - **サービスメッシュ**: AWS App Meshとの統合
+  - **ヘルスチェック**: コンテナレベルの健全性確認
+  - **負荷分散**: クライアントサイドロードバランシング
+- **動的更新メカニズム**
+  - **ECS Events**: タスク起動/停止イベント
+  - **Lambda処理**: Route 53レコードの追加/削除
+  - **TTL**: 60秒（迅速な切り替え対応）
+
+**Infrastructure Records管理**:
+- **データベースエンドポイント**
+  - **命名規則**: aurora-{部門}-{サービス}.infra.technova.internal
+  - **CNAME**: Auroraクラスターエンドポイントを抽象化
+  - **フェイルオーバー**: ReaderからWriterへの自動昇格対応
+- **共有サービスエンドポイント**
+  - **用途別分離**: 各サービスごとに専用エンドポイント
+  - **アクセス制御**: VPC Endpoint Policyで制限
+  - **監視**: エンドポイント別のメトリクス収集
+
+#### 4.1.3 Route 53 Resolver統合 (Network Hub Account)
+```
+hybrid-dns-integration
+├── Inbound Resolver Endpoints:
+│   ├── Primary: 10.150.20.10 (AZ-1a)
+│   ├── Secondary: 10.150.20.11 (AZ-1c)
+│   ├── Purpose: オンプレミス → AWS DNS解決
+│   └── Supported Queries:
+│       ├── *.technova.internal → Private Hosted Zone
+│       ├── aws.technova.local → AWS統合ドメイン
+│       └── *.amazonaws.com → VPC Endpoint Private DNS
+├── Outbound Resolver Endpoints:
+│   ├── Primary: 10.150.20.20 (AZ-1a)
+│   ├── Secondary: 10.150.20.21 (AZ-1c)
+│   ├── Purpose: AWS → オンプレミス DNS解決
+│   └── Target DNS Servers:
+│       ├── dc01.technova.local: 192.168.1.10
+│       ├── dc02.technova.local: 192.168.1.11
+│       └── Backup DNS: 192.168.1.12
+├── Resolver Rules (RAM共有):
+│   ├── technova.local → オンプレミスDC
+│   ├── *.technova.local → オンプレミスDC
+│   ├── corp.technova.com → オンプレミスDC
+│   └── 適用対象: 全120アカウントVPC
+└── DNS Query Logging:
+    ├── CloudWatch Logs統合
+    ├── Query Pattern Analysis
+    └── Anomaly Detection
+```
+
+**Inbound Resolver設計詳細**:
+- **エンドポイント配置**
+  - **IP固定**: Elastic IPを割り当て、オンプレミス側で静的設定
+  - **セキュリティグループ**: オンプレミスDNSサーバーからのみ許可
+  - **スケーリング**: 各エンドポイント10,000 QPS対応
+- **クエリ処理**
+  - **優先順位**: VPC DNS → Private Hosted Zone → Public DNS
+  - **キャッシュ**: ネガティブキャッシュ60秒、ポジティブキャッシュ300秒
+  - **DNSSEC**: 検証有効（DO bitセット時）
+
+**Outbound Resolver設計詳細**:
+- **フォワーダー設定**
+  - **条件付き転送**: ドメイン別に転送先を設定
+  - **フォールバック**: プライマリ障害時は自動的にセカンダリへ
+  - **ヘルスチェック**: 5秒間隔でDNSクエリによる死活監視
+- **対象ドメイン**
+  - **.technova.local**: Active Directoryドメイン
+  - **10.in-addr.arpa**: 逆引きDNS
+  - **legacy.technova.com**: レガシーシステム用
+
+**DNS Query Logging分析**:
+- **ログ内容**
+  - **記録項目**: タイムスタンプ、クエリ元IP、クエリ先、応答
+  - **ボリューム**: 1日あたり約1000万クエリ
+  - **保存期間**: 30日（CloudWatch Logs）、1年（S3アーカイブ）
+- **分析用途**
+  - **性能分析**: クエリレイテンシ、キャッシュヒット率
+  - **セキュリティ**: 異常なクエリパターン検出（DGAドメイン等）
+  - **キャパシティ**: クエリ数トレンドからの容量計画
+
+#### 4.1.4 オンプレミスDNS統合
+```
+technova.local (Active Directory)
+├── Domain Controllers:
+│   ├── dc01.technova.local (192.168.1.10)
+│   ├── dc02.technova.local (192.168.1.11)
+│   └── dc03.technova.local (192.168.1.12) - Backup
+├── DNS Zones:
+│   ├── technova.local (AD統合ゾーン)
+│   ├── _msdcs.technova.local (AD Services)
+│   ├── _sites.technova.local (AD Sites)
+│   └── _tcp.technova.local (SRV Records)
+├── Conditional Forwarders:
+│   ├── aws.technova.local → 10.150.20.10, 10.150.20.11
+│   ├── technova.internal → 10.150.20.10, 10.150.20.11
+│   └── amazonaws.com → 10.150.20.10, 10.150.20.11
+├── Hybrid Integration:
+│   ├── User Accounts: user.technova.local
+│   ├── Computer Accounts: computer.technova.local
+│   ├── Service Accounts: service.technova.local
+│   └── Application Services: app.technova.local
+└── Security Integration:
+    ├── DNSSEC Validation
+    ├── DNS Filtering (悪意ドメインブロック)
+    └── Query Audit Logging
+```
+
+**Domain Controller構成**:
+- **プライマリ/セカンダリ**
+  - **役割**: FSMO役割の分散配置
+  - **同期**: サイト間レプリケーション15分間隔
+  - **バックアップ**: 日次でシステム状態バックアップ
+- **DNS サービス設定**
+  - **統合ゾーン**: Active Directory統合によるセキュアな更新
+  - **スカベンジング**: 7日間隔で古いレコードを自動削除
+  - **転送**: 未解決クエリはRoute 53 Resolverへ転送
+
+**Conditional Forwarders詳細**:
+- **AWS向け転送設定**
+  - **優先順位付け**: プライマリ/セカンダリResolverエンドポイント
+  - **タイムアウト**: 3秒（デフォルト2秒から延長）
+  - **再帰クエリ**: 有効（Resolver側で解決）
+- **逆引き設定**
+  - **10.in-addr.arpa**: AWS VPCの逆引きをResolverへ転送
+  - **PTRレコード**: 主要サーバーには明示的に設定
+
+### 4.2 Split-View DNS実装
+
+#### 4.2.1 同一FQDN・環境別解決
+```
+api.technova.com の解決パターン:
+├── External (Internet) Resolution:
+│   ├── Query Source: 外部ユーザー・パートナー
+│   ├── Resolution: CloudFront Distribution
+│   ├── Endpoint: d987654321.cloudfront.net
+│   ├── Features: WAF, DDoS Protection, Global CDN
+│   └── Authentication: API Key, OAuth 2.0
+├── Internal (VPC) Resolution:
+│   ├── Query Source: 120アカウント内ECS Tasks
+│   ├── Resolution: Internal Application Load Balancer
+│   ├── Endpoint: internal-api-12345.ap-northeast-1.elb.amazonaws.com
+│   ├── Features: High Performance, Low Latency
+│   └── Authentication: IAM Roles, mTLS
+└── On-Premises Resolution:
+    ├── Query Source: オンプレミスシステム
+    ├── Resolution: VPN経由Internal ALB
+    ├── Endpoint: 10.100.10.100 (Private IP)
+    └── Authentication: AD統合, Kerberos
+```
+
+**External Resolution設計理由**:
+- **CloudFront経由の理由**: グローバルエッジロケーションでのキャッシュとWAF保護により、パフォーマンスとセキュリティを両立
+- **認証方式**: 外部パートナー向けにAPI KeyとOAuth 2.0の2方式を提供し、柔軟な統合を実現
+- **DDoS対策**: CloudFront + Shield Standardにより、L3/L4攻撃を自動的に緩和
+
+**Internal Resolution設計理由**:
+- **直接ALBアクセス**: CloudFrontを経由しないことで、内部通信のレイテンシを95%削減（100ms→5ms）
+- **mTLS認証**: 内部サービス間通信では相互TLS認証により、なりすましを防止
+- **コスト最適化**: CloudFront経由のデータ転送費用を削減（月額約200万円の節約）
+
+**On-Premises Resolution設計理由**:
+- **プライベートIP使用**: セキュリティポリシーに準拠し、すべての通信を内部ネットワーク内で完結
+- **AD統合認証**: 既存のKerberos基盤を活用し、シングルサインオンを実現
+- **VPN経由**: DirectConnectに加えてVPN経由も可能とし、冗長性を確保
+
+#### 4.2.2 portal.technova.com の最適化
+```
+├── Hairpin Problem Resolution:
+│   ├── 問題: VPC内 → CloudFront → Origin (同じVPC)
+│   ├── 解決: VPC内Private Hosted Zone
+│   └── portal.technova.internal → Internal ALB
+├── Cost & Performance Benefits:
+│   ├── Data Transfer Cost削減
+│   ├── Latency削減 (CloudFront Bypass)
+│   └── 内部最適化ルーティング
+└── Implementation:
+    ├── Private Zone: portal.technova.internal → 10.100.10.200
+    ├── Public Zone: portal.technova.com → CloudFront
+    └── Conditional: VPC内は内部解決優先
+```
+
+**Hairpin Problem詳細**:
+- **問題の影響**: 不要なインターネット往復により、レイテンシ増加とデータ転送コスト発生
+- **解決方法**: Private Hosted Zoneで内部向けレコードを定義し、VPC内通信を最適化
+- **実装効果**: レスポンスタイム80%改善、月額データ転送コスト150万円削減
+
+**実装詳細**:
+- **レコード優先順位**: VPC内ではPrivate Zone → Public Zoneの順で解決
+- **フォールバック**: Private Zone解決失敗時は自動的にPublic Zoneを参照
+- **更新同期**: GitOpsによりPublic/Private Zoneの更新を自動同期
+
+## 5. VPC Endpoint統合最適化（共有・パフォーマンス）
+
+### 5.1 VPC Endpoint共有戦略完全版
+
+#### 5.1.1 Shared Services Account内の中央集権Endpoint
+```
+central-vpc-endpoints
+├── S3 Gateway Endpoint (無料):
+│   ├── 配置: 全120アカウントでローカル配置
+│   ├── Route Table統合: 自動プロパゲーション
+│   └── Policy: 最小権限（アカウント別制限）
+├── ECR Interface Endpoints:
+│   ├── ECR API: api.ecr.ap-northeast-1.amazonaws.com
+│   ├── ECR DKR: *.dkr.ecr.ap-northeast-1.amazonaws.com
+│   ├── Private DNS: 有効化
+│   ├── Security Group: sg-ecr-endpoint-shared
+│   └── RAM共有: 全120アカウント
+├── Secrets Manager Interface Endpoint:
+│   ├── DNS: secretsmanager.ap-northeast-1.amazonaws.com
+│   ├── 用途: DB認証情報、API Keys
+│   ├── Security Group: sg-secrets-endpoint-shared
+│   └── Audit: 全アクセスログ記録
+├── Systems Manager Interface Endpoints:
+│   ├── SSM: ssm.ap-northeast-1.amazonaws.com
+│   ├── SSM Messages: ssmmessages.ap-northeast-1.amazonaws.com
+│   ├── EC2 Messages: ec2messages.ap-northeast-1.amazonaws.com
+│   └── 用途: パッチ管理、設定管理
+└── CloudWatch Interface Endpoints:
+    ├── Logs: logs.ap-northeast-1.amazonaws.com
+    ├── Monitoring: monitoring.ap-northeast-1.amazonaws.com
+    ├── Events: events.ap-northeast-1.amazonaws.com
+    └── 用途: 統合監視・ログ管理
+```
+
+**S3 Gateway Endpoint設計**:
+- **ローカル配置の理由**: Gateway Endpointは無料かつVPC単位の設定のため、各VPCに個別配置が最適
+- **ポリシー設計**: バケット別・プレフィックス別のきめ細かいアクセス制御を実装
+- **自動化**: CloudFormation StackSetsで全アカウントに一括展開
+
+**ECR Interface Endpoints設計**:
+- **共有の効果**: 120アカウント分のエンドポイント料金（月額約432万円）を1/120に削減
+- **性能考慮**: エンドポイントあたり10Gbpsの帯域を確保し、大規模なイメージpullに対応
+- **可用性**: 3AZに分散配置し、AZ障害時も継続利用可能
+
+**Secrets Manager Endpoint設計**:
+- **セキュリティ強化**: インターネット経由でのシークレット取得を完全に遮断
+- **監査対応**: 全アクセスをCloudTrailで記録し、不正アクセスを検知
+- **パフォーマンス**: シークレット取得のレイテンシを70%削減（50ms→15ms）
+
+**Systems Manager Endpoints設計**:
+- **3つのエンドポイント必要性**: Session Manager、Run Command、State Managerそれぞれで異なるエンドポイントが必要
+- **コスト削減**: プライベートサブネットのEC2がNAT Gateway不要でSSM利用可能
+- **運用効率**: パッチ適用、設定変更を完全にプライベートネットワーク内で実行
+
+#### 5.1.2 アカウント別専用Endpoints
+```
+specialized-endpoints
+├── 製造部門専用:
+│   ├── RDS Interface Endpoint
+│   │   ├── DNS: rds.ap-northeast-1.amazonaws.com
+│   │   ├── 用途: Aurora管理API
+│   │   └── Security: 製造DB accountのみアクセス
+│   └── SNS Interface Endpoint
+│       ├── DNS: sns.ap-northeast-1.amazonaws.com
+│       └── 用途: 生産アラート通知
+├── IoT部門専用:
+│   ├── IoT Core Interface Endpoint
+│   │   ├── DNS: iot.ap-northeast-1.amazonaws.com
+│   │   └── 用途: デバイス接続・管理
+│   ├── Kinesis Interface Endpoint
+│   │   ├── DNS: kinesis.ap-northeast-1.amazonaws.com
+│   │   └── 用途: ストリーミングデータ処理
+│   └── Timestream Interface Endpoint
+│       ├── DNS: query.timestream.ap-northeast-1.amazonaws.com
+│       └── 用途: 時系列データ分析
+└── 共通サービス専用:
+    ├── Lambda Interface Endpoint
+    │   ├── DNS: lambda.ap-northeast-1.amazonaws.com
+    │   └── 用途: サーバーレス処理
+    └── STS Interface Endpoint
+        ├── DNS: sts.ap-northeast-1.amazonaws.com
+        └── 用途: IAM Role Assume
+```
+
+**製造部門専用Endpoints理由**:
+- **RDS Endpoint**: データベース管理操作を製造部門に限定し、誤操作による他部門への影響を防止
+- **SNS Endpoint**: 製造ラインの緊急停止など、クリティカルなアラートの確実な配信を保証
+- **分離効果**: 他部門のトラフィックに影響されない、専用の帯域とセキュリティポリシー適用
+
+**IoT部門専用Endpoints理由**:
+- **大量データ対応**: 7,800台のIoTデバイスからの同時接続に対応する専用リソース
+- **低レイテンシ要求**: リアルタイムデータ処理のため、専用エンドポイントで遅延を最小化
+- **スケーラビリティ**: IoT特有のバースト的なトラフィックパターンに対応
+
+### 5.2 VPC Endpoint DNS解決最適化
+
+#### 5.2.1 Private DNS統合
+```
+endpoint-dns-resolution
+├── 解決優先順位:
+│   ├── 1. VPC内のPrivate DNS (VPC Endpoint)
+│   ├── 2. Route 53 Private Hosted Zone
+│   ├── 3. Route 53 Resolver Rules (オンプレミス)
+│   └── 4. Public DNS Resolution
+├── カスタムDNS Routing:
+│   ├── *.amazonaws.com → VPC Endpoint Private DNS
+│   ├── *.technova.internal → Private Hosted Zone
+│   ├── *.technova.local → オンプレミスDC
+│   └── その他 → Public DNS
+├── Performance Optimization:
+│   ├── DNS Caching: 300秒TTL
+│   ├── Negative Caching: 60秒TTL
+│   └── Query Distribution: Round Robin
+└── Monitoring:
+    ├── DNS Query Latency
+    ├── Resolution Success Rate
+    └── Endpoint Health Status
+```
+
+**DNS解決優先順位の設計理由**:
+- **レイテンシ最小化**: 最も近いリゾルバから順に問い合わせ
+- **フォールバック**: 上位リゾルバ障害時も名前解決を継続
+- **セキュリティ**: 内部リソースは内部DNSでのみ解決可能
+
+**Performance Optimization詳細**:
+- **キャッシュ戦略**: 頻繁にアクセスされるエンドポイントの解決結果をキャッシュ
+- **負荷分散**: 複数のDNSリゾルバ間でクエリを分散
+- **モニタリング**: DNS解決の成功率とレイテンシを継続的に監視
+
+### 5.3 クロスアカウントEndpoint利用フロー
+
+#### 5.3.1 technova-mfg-prod-app での S3アクセス例
+```
+step-by-step-flow
+├── 1. Application Request:
+│   ├── ECS Task: aws s3 ls s3://technova-app-data-prod/
+│   └── DNS Query: s3.ap-northeast-1.amazonaws.com
+├── 2. DNS Resolution:
+│   ├── VPC DNS Resolver: 169.254.169.253
+│   ├── Check: VPC Endpoint Private DNS
+│   └── Result: 10.0.30.200 (VPC Endpoint ENI)
+├── 3. Network Routing:
+│   ├── Source: ECS Task (10.0.30.100)
+│   ├── Destination: VPC Endpoint (10.0.30.200)
+│   ├── Route: Local VPC routing
+│   └── Security Group: sg-s3-endpoint-access
+├── 4. API Request Processing:
+│   ├── VPC Endpoint → S3 Service
+│   ├── IAM Role Validation
+│   ├── Bucket Policy Check
+│   └── Object Access Authorization
+├── 5. Response Path:
+│   ├── S3 Service → VPC Endpoint
+│   ├── VPC Endpoint → ECS Task
+│   └── Data Transfer: Private network内
+└── 6. Audit & Logging:
+    ├── VPC Flow Logs: 通信記録
+    ├── S3 Access Logs: API操作記録
+    └── CloudTrail: 管理操作記録
+```
+
+**各ステップの詳細説明**:
+
+**Step 1 - Application Request**:
+- **実行環境**: ECS Fargate Task（メモリ4GB、vCPU 2）
+- **SDK**: AWS SDK for Python (boto3) v1.26.137
+- **リトライ設定**: 最大3回、指数バックオフ
+
+**Step 2 - DNS Resolution**:
+- **解決プロセス**: VPC DNSがEndpoint Private DNSを優先的に返却
+- **キャッシュヒット率**: 約85%（300秒TTL）
+- **フェイルオーバー**: Private DNS解決失敗時は通常のS3エンドポイントへ
+
+**Step 3 - Network Routing**:
+- **ルーティング最適化**: VPC内ローカルルーティングで高速通信
+- **セキュリティグループ**: 送信元ECSタスクのENIからのみ許可
+- **ネットワークACL**: ステートレスフィルタリングで追加保護
+
+**Step 4 - API Request Processing**:
+- **認証フロー**: 
+  1. ECSタスクロールのAssumeRole
+  2. 一時認証情報の取得
+  3. SigV4署名の生成
+  4. リクエストヘッダーへの付与
+- **認可チェック**:
+  1. IAMポリシー評価
+  2. S3バケットポリシー評価
+  3. S3 ACL評価（レガシー）
+  4. 最終的なAllow/Deny判定
+
+**Step 5 - Response Path**:
+- **データ転送最適化**: プライベートネットワーク内で完結
+- **コスト削減効果**: インターネットデータ転送費用ゼロ
+- **パフォーマンス**: パブリックエンドポイント比で60%高速化
+
+**Step 6 - Audit & Logging**:
+- **VPC Flow Logs**: 5タプル情報（送信元/宛先IP、ポート、プロトコル）
+- **S3 Access Logs**: オブジェクトレベルの操作記録
+- **CloudTrail**: API呼び出しの詳細（誰が、いつ、何を）
+- **保存期間**: Flow Logs 90日、S3 Logs 1年、CloudTrail 7年
+
+## 6. マイクロサービス間通信設計（gRPC + Service Connect統合）
+
+### 6.1 ECS Service Connect + gRPC統合アーキテクチャ
+
+#### 6.1.1 Service Connect Namespace統合
+```
+microservices-communication
+├── Manufacturing Namespace:
+│   ├── Namespace: manufacturing.technova.local
+│   ├── Services:
+│   │   ├── planning:9090 (生産計画gRPCサービス)
+│   │   ├── inventory:9091 (在庫管理gRPCサービス)
+│   │   ├── tracking:9092 (工程追跡gRPCサービス)
+│   │   └── material:9093 (原材料gRPCサービス)
+│   ├── Service Discovery:
+│   │   ├── 内部DNS: planning.manufacturing.technova.local
+│   │   ├── ヘルスチェック: gRPC Health Check Protocol
+│   │   └── Load Balancing: Round Robin
+│   └── Cross-Account Access:
+│       ├── sales.technova.local → inventory:9091
+│       └── common.technova.local → 認証サービス統合
+├── Sales Namespace:
+│   ├── Namespace: sales.technova.local
+│   ├── Services:
+│   │   ├── order:9100 (受注管理gRPCサービス)
+│   │   ├── customer:9101 (顧客管理gRPCサービス)
+│   │   ├── shipping:9102 (出荷管理gRPCサービス)
+│   │   └── billing:9103 (請求管理gRPCサービス)
+│   ├── Service Discovery:
+│   │   ├── 内部DNS: order.sales.technova.local
+│   │   ├── ヘルスチェック: gRPC Health Check Protocol
+│   │   └── Load Balancing: Weighted Round Robin
+│   └── Cross-Account Access:
+│       ├── manufacturing.technova.local → order:9100
+│       └── service.technova.local → customer:9101
+├── Service Namespace:
+│   ├── Namespace: service.technova.local
+│   ├── Services:
+│   │   ├── equipment:9110 (機器管理gRPCサービス)
+│   │   ├── maintenance:9111 (保守履歴gRPCサービス)
+│   │   ├── appointment:9112 (予約管理gRPCサービス)
+│   │   └── parts:9113 (部品管理gRPCサービス)
+│   └── Cross-Account Access:
+│       ├── iot.technova.local → equipment:9110
+│       └── manufacturing.technova.local → parts:9113
+├── IoT Namespace:
+│   ├── Namespace: iot.technova.local
+│   ├── Services:
+│   │   ├── connectivity:9120 (デバイス接続gRPCサービス)
+│   │   ├── telemetry:9121 (テレメトリgRPCサービス)
+│   │   ├── analytics:9122 (分析gRPCサービス)
+│   │   └── alert:9123 (アラートgRPCサービス)
+│   └── High-Throughput Configuration:
+│       ├── telemetry:9121 → NLB経由（大容量データ）
+│       └── analytics:9122 → 機械学習処理用最適化
+└── Common Namespace:
+    ├── Namespace: common.technova.local
+    ├── Services:
+    │   ├── auth:9130 (認証gRPCサービス)
+    │   ├── notification:9131 (通知gRPCサービス)
+    │   ├── master:9132 (マスターデータgRPCサービス)
+    │   └── reporting:9133 (レポーティングgRPCサービス)
+    └── Global Access:
+        └── 全事業部門からのアクセス許可
+```
+
+**Service Connect設計の詳細**:
+
+**Manufacturing Namespace設計理由**:
+- **gRPC選定理由**: バイナリプロトコルによる高速通信と、Protocol Buffersによる型安全性
+- **ポート割り当て**: 9090-9093の連続ポートで管理を簡素化
+- **ヘルスチェック**: gRPC標準のHealth Checking Protocolで統一的な死活監視
+
+**Sales Namespace特殊設定**:
+- **Weighted Round Robin**: インスタンスの性能差を考慮した重み付け負荷分散
+- **クロスアカウント設計**: Transit Gateway経由でも低レイテンシを維持（<10ms）
+
+**IoT Namespace最適化**:
+- **NLB使用理由**: L4ロードバランサーで大量コネクション（10万同時接続）に対応
+- **専用設定**: テレメトリデータの特性に合わせたタイムアウト設定（30秒）
+
+### 6.2 クロスアカウントgRPC通信フロー
+
+#### 6.2.1 technova-sales-prod-app → technova-mfg-prod-app 通信例
+```
+step-by-step-grpc-flow
+├── 1. Service Discovery:
+│   ├── Source: order.sales.technova.local (10.1.30.100)
+│   ├── Target: inventory.manufacturing.technova.local
+│   ├── DNS Resolution: Route 53 Private Hosted Zone
+│   └── Result: 10.0.30.101:9091
+├── 2. Network Routing:
+│   ├── Sales VPC → Transit Gateway
+│   ├── Route Table: cross-department-api-rt
+│   ├── Security Group: sg-cross-dept-grpc
+│   └── Destination: Manufacturing VPC
+├── 3. gRPC Connection Establishment:
+│   ├── TLS Handshake: mTLS証明書検証
+│   ├── Service Connect Proxy経由
+│   ├── Load Balancing: Target Instance選択
+│   └── Connection Pool: 再利用設定
+├── 4. gRPC Request Processing:
+│   ├── Method: /inventory.InventoryService/CheckStock
+│   ├── Metadata: Authentication Headers
+│   ├── Payload: Product IDs and Quantities
+│   └── Timeout: 5秒
+├── 5. Response Handling:
+│   ├── gRPC Response: Stock Availability
+│   ├── Service Connect Metrics収集
+│   ├── Circuit Breaker状態更新
+│   └── Connection Return to Pool
+└── 6. Monitoring & Observability:
+    ├── CloudWatch Metrics: レイテンシ、成功率
+    ├── X-Ray Tracing: End-to-End追跡
+    ├── Service Connect Insights: 通信パターン
+    └── Custom Metrics: ビジネスKPI
+```
+
+**通信フローの詳細実装**:
+
+**Step 1 - Service Discovery詳細**:
+- **DNS解決順序**: 
+  1. ECSタスクのlocal cache（TTL 60秒）
+  2. Service Connect DNS
+  3. Route 53 Private Zone
+- **エンドポイント選択**: ヘルスチェック成功したインスタンスのみ
+- **フェイルオーバー**: 1秒以内に別インスタンスへ切り替え
+
+**Step 2 - Network Routing詳細**:
+- **Transit Gateway最適化**: 
+  - ECMP有効で複数パス利用
+  - MTUサイズ8500バイト（Jumbo Frame）
+  - 遅延: VPC間で2-3ms
+- **Security Group詳細ルール**:
+  ```
+  Inbound:
+  - Protocol: TCP
+  - Port: 9091
+  - Source: sg-sales-grpc (10.1.30.0/24)
+  - Description: Allow gRPC from Sales order service
+  ```
+
+**Step 3 - gRPC Connection詳細**:
+- **mTLS設定**:
+  - 証明書: AWS Private CA発行（90日有効）
+  - 暗号スイート: TLS_AES_256_GCM_SHA384
+  - 証明書検証: CN、SAN、有効期限、失効確認
+- **Connection Pool設定**:
+  - 最小接続数: 10
+  - 最大接続数: 100
+  - アイドルタイムアウト: 5分
+  - Keep-Alive: 30秒間隔
+
+**Step 4 - gRPC Request詳細**:
+- **Protocol Buffers定義**:
+  ```protobuf
+  service InventoryService {
+    rpc CheckStock(CheckStockRequest) returns (CheckStockResponse);
+  }
+  message CheckStockRequest {
+    repeated string product_ids = 1;
+    repeated int32 quantities = 2;
+  }
+  ```
+- **メタデータ**: 
+  - Authorization: Bearer token
+  - X-Request-ID: UUID
+  - X-B3-TraceId: 分散トレース用
+
+**Step 5 - Response Handling詳細**:
+- **Circuit Breaker設定**:
+  - エラー閾値: 50%（10リクエスト中5つ失敗）
+  - Open期間: 30秒
+  - Half-Open試行: 1リクエスト
+- **リトライポリシー**:
+  - 最大リトライ: 3回
+  - バックオフ: 指数関数的（100ms, 200ms, 400ms）
+  - リトライ対象: 503, 504, タイムアウト
+
+### 6.3 gRPC通信セキュリティ
+
+#### 6.3.1 mTLS (Mutual TLS) 設定
+```
+cross-account-mtls-config
+├── Certificate Authority:
+│   ├── AWS Private CA統合
+│   ├── アカウント別証明書発行
+│   └── 自動更新・ローテーション
+├── Service Certificates:
+│   ├── manufacturing-planning.crt
+│   ├── sales-order.crt
+│   ├── 有効期限: 90日
+│   └── 自動更新: AWS Certificate Manager
+├── Authentication Flow:
+│   ├── Client Certificate Verification
+│   ├── Server Certificate Verification
+│   ├── Common Name Validation
+│   └── Certificate Revocation Check
+└── Security Groups:
+    ├── Source: sg-sales-grpc
+    ├── Target: sg-manufacturing-grpc
+    ├── Port: 9090-9093 (gRPCサービス)
+    └── Protocol: TCP (TLS encrypted)
+```
+
+**Certificate Authority設計**:
+- **階層構造**:
+  - Root CA: 10年有効（オフライン保管）
+  - Intermediate CA: 5年有効（AWS Private CA）
+  - Service Certificates: 90日有効（自動更新）
+- **証明書テンプレート**:
+  - Subject: CN=service.namespace.technova.local
+  - SAN: DNS名とIPアドレス両方を含む
+  - Key Usage: Digital Signature, Key Encipherment
+  - Extended Key Usage: Server Auth, Client Auth
+
+**自動更新メカニズム**:
+- **更新タイミング**: 有効期限30日前
+- **更新プロセス**:
+  1. Lambda関数が毎日証明書をチェック
+  2. 更新が必要な証明書を検出
+  3. 新しい証明書をリクエスト
+  4. Secrets Managerに保存
+  5. ECSタスクの再デプロイ
+- **ゼロダウンタイム**: Blue/Greenデプロイで証明書更新
+
+**Security Group設計詳細**:
+- **最小権限の原則**: 必要なポートとソースのみ許可
+- **動的更新**: タグベースで自動的にルール更新
+- **監査ログ**: すべての変更をCloudTrailで記録
+
+## 7. ハイブリッド接続設計（完全統合）
+
+### 7.1 AWS Direct Connect拡張構成
+
+#### 7.1.1 DirectConnect統合設計
+```
+hybrid-connectivity-architecture
+├── Primary Connection (東京):
+│   ├── 専用線: 2Gbps × 2本 (冗長化)
+│   ├── Virtual Gateway: vgw-technova-primary
+│   ├── BGP ASN: 65000 (オンプレミス)
+│   └── Advertised Routes: 10.0.0.0/8 (全AWS VPC)
+├── Secondary Connection (大阪):
+│   ├── 専用線: 1Gbps × 2本 (DR用)
+│   ├── Virtual Gateway: vgw-technova-secondary
+│   ├── BGP ASN: 65001 (DR)
+│   └── Standby Configuration
+├── Virtual Interfaces:
+│   ├── Private VIF 1: Manufacturing系アカウント
+│   ├── Private VIF 2: Sales系アカウント
+│   ├── Private VIF 3: Service系アカウント
+│   ├── Private VIF 4: IoT系アカウント
+│   └── Transit VIF: 全アカウント統合接続
+└── Traffic Engineering:
+    ├── AS-PATH Prepending: トラフィック制御
+    ├── Local Preference: 優先経路設定
+    └── MED Attributes: コスト最適化
+```
+
+**Primary Connection詳細設計**:
+- **物理接続**:
+  - ロケーション: 東京 AP Northeast Direct Connect Location
+  - ポートスピード: 10Gbps（2Gbps利用）
+  - 接続プロバイダ: 冗長化のため2社利用
+- **論理設定**:
+  - VLAN ID: 100（Primary）、101（Secondary）
+  - BGP MD5認証: 有効
+  - BFD（Bidirectional Forwarding Detection）: 有効
+
+**Virtual Interfaces設計**:
+- **部門別VIF分離理由**:
+  - QoS適用: 部門別に帯域保証
+  - セキュリティ: 部門間トラフィックの分離
+  - 課金: 部門別のデータ転送量追跡
+- **Transit VIF利点**:
+  - 設定簡素化: 1つのVIFで全VPC接続
+  - スケーラビリティ: VPC追加時の作業不要
+
+### 7.2 Site-to-Site VPN統合
+
+#### 7.2.1 VPN冗長化設計
+```
+vpn-backup-architecture
+├── Primary VPN Connections:
+│   ├── Tunnel 1: 東京AZ-1a → オンプレミス
+│   ├── Tunnel 2: 東京AZ-1c → オンプレミス
+│   ├── BGP Routing: 動的経路制御
+│   └── Bandwidth: 1.25Gbps per tunnel
+├── Secondary VPN Connections:
+│   ├── Tunnel 3: 大阪AZ-3a → オンプレミス
+│   ├── Tunnel 4: 大阪AZ-3b → オンプレミス
+│   ├── Standby Mode: DirectConnect障害時
+│   └── Automatic Failover: 180秒以内
+├── Routing Priority:
+│   ├── 1st: DirectConnect (Primary)
+│   ├── 2nd: DirectConnect (Secondary)  
+│   ├── 3rd: VPN (Primary)
+│   └── 4th: VPN (Secondary)
+└── Monitoring:
+    ├── Tunnel Status: リアルタイム監視
+    ├── Latency Monitoring: 品質監視
+    ├── Bandwidth Utilization: 使用率監視
+    └── Failover Testing: 月次テスト
+```
+
+**VPN設定詳細**:
+- **IPsec設定**:
+  - IKEv2使用
+  - DH Group: 14（2048-bit）
+  - 暗号化: AES-256-GCM
+  - 整合性: SHA-256
+  - PFS: 有効（DH Group 14）
+- **トンネル設定**:
+  - Dead Peer Detection: 10秒間隔
+  - NAT-T: 有効
+  - Fragmentation: パス内MTU探索
+
+**フェイルオーバー設計**:
+- **検出**: BGP Hold Timer（180秒）
+- **切替時間**: 
+  - DirectConnect → VPN: 3分以内
+  - Primary → Secondary: 30秒以内
+- **切戻し**: 自動（5分後）または手動
+
+### 7.3 オンプレミス統合設計
+
+#### 7.3.1 ハイブリッドサービス統合
+```
+onpremises-integration
+├── Active Directory統合:
+│   ├── AD Connector: aws.technova.local
+│   ├── User Authentication: SSO統合
+│   ├── Computer Accounts: AWS EC2統合
+│   └── Group Policy: ハイブリッド適用
+├── File Services統合:
+│   ├── FSx for Windows: ファイルサーバー移行
+│   ├── DFS Namespace: 統合名前空間
+│   ├── Backup Integration: AWS Backup
+│   └── Access Permissions: AD統合
+├── Database統合:
+│   ├── AWS DMS: データ移行・同期
+│   ├── VPN Tunnel: 専用DB接続
+│   ├── Read Replica: オンプレ → Aurora
+│   └── Cutover Plan: 段階的移行
+└── Monitoring統合:
+    ├── SCOM Integration: 既存監視連携
+    ├── CloudWatch Agent: メトリクス送信
+    ├── Hybrid Dashboard: 統合表示
+    └── Alert Correlation: アラート統合
+```
+
+**Active Directory統合詳細**:
+- **AD Connector設定**:
+  - タイプ: Large（500,000オブジェクト対応）
+  - DNS設定: オンプレミスDCを指定
+  - サービスアカウント: 最小権限で設定
+- **認証フロー**:
+  1. ユーザーがAWSサービスにアクセス
+  2. AD ConnectorがオンプレミスADに認証要求
+  3. Kerberosチケット発行
+  4. AWSリソースへのアクセス許可
+
+**FSx for Windows統合**:
+- **移行戦略**:
+  - Phase 1: 読み取り専用データから移行
+  - Phase 2: 部門別に段階移行
+  - Phase 3: 完全切替とオンプレミス廃止
+- **データ同期**: 
+  - DFS-R使用で双方向同期
+  - 変更は1分以内に反映
+  - 競合解決: Last Writer Wins
+
+**Database移行詳細**:
+- **AWS DMS設定**:
+  - インスタンスクラス: dms.c5.4xlarge
+  - Multi-AZ: 有効（高可用性）
+  - 暗号化: KMS使用
+- **移行フェーズ**:
+  1. 初期ロード: 週末実施
+  2. CDC（変更データキャプチャ）: 継続同期
+  3. 検証: データ整合性確認
+  4. カットオーバー: 計画停止で切替
+
+## 8. パフォーマンス最適化（全面強化）
+
+### 8.1 ネットワーク最適化戦略
+
+#### 8.1.1 レイテンシ最適化
+```
+network-performance-optimization
+├── Enhanced Networking:
+│   ├── SR-IOV: 全ECSインスタンスで有効化
+│   ├── DPDK: 高性能パケット処理
+│   ├── CPU Affinity: ネットワーク処理最適化
+│   └── Interrupt Coalescing: CPU負荷軽減
+├── Placement Groups:
+│   ├── Cluster PG: 関連サービス群配置
+│   │   └── manufacturing-planning + aurora-manufacturing
+│   ├── Partition PG: 可用性重視サービス
+│   └── Spread PG: 独立性重視サービス
+├── Instance Optimization:
+│   ├── c6gn.xlarge: ネットワーク最適化インスタンス
+│   ├── 25Gbps Enhanced Networking
+│   ├── 低レイテンシ要件: <1ms (同一AZ内)
+│   └── 高スループット: >10Gbps
+└── Connection Optimization:
+    ├── Keep-Alive: 長時間接続維持
+    ├── Connection Pooling: gRPC接続プール
+    ├── Multiplexing: HTTP/2活用
+    └── Compression: gRPC圧縮有効化
+```
+
+**Enhanced Networking詳細実装**:
+- **SR-IOV効果測定**:
+  - レイテンシ: 50%削減（100μs → 50μs）
+  - スループット: 40%向上（10Gbps → 14Gbps）
+  - CPU使用率: 30%削減
+- **DPDK実装**:
+  - パケット処理: 1000万pps達成
+  - ゼロコピー: メモリコピー削減
+  - バッチ処理: 複数パケット一括処理
+
+**Placement Groups最適化**:
+- **Cluster PG使用例**:
+  - 対象: DB接続が多いアプリケーション群
+  - 効果: DB接続レイテンシ80%削減
+  - 制約: 同一ラック配置のためAZ障害時は全影響
+- **使い分け基準**:
+  - レイテンシ重視 → Cluster PG
+  - 可用性重視 → Partition/Spread PG
+
+### 8.2 帯域最適化
+
+#### 8.2.1 Traffic Engineering
+```
+bandwidth-optimization
+├── QoS (Quality of Service):
+│   ├── Critical: 認証・決済系 (最高優先度)
+│   ├── High: リアルタイム通信 (高優先度)
+│   ├── Medium: バッチ処理 (中優先度)
+│   └── Low: ログ・バックアップ (低優先度)
+├── Traffic Shaping:
+│   ├── Rate Limiting: API別帯域制限
+│   ├── Burst Handling: 一時的スパイク対応
+│   ├── Fair Queuing: サービス間公平性
+│   └── Congestion Control: 輻輳制御
+├── Load Distribution:
+│   ├── ECMP: 複数経路負荷分散
+│   ├── Weighted Routing: 能力別重み付け
+│   ├── Geographic Load Balancing
+│   └── Time-based Routing: 時間帯別最適化
+└── Caching Strategy:
+    ├── CloudFront: 静的コンテンツ
+    ├── ElastiCache: データベースキャッシュ
+    ├── API Gateway Caching: API応答キャッシュ
+    └── Application-level: アプリケーション内キャッシュ
+```
+
+**QoS実装詳細**:
+- **優先度マーキング**:
+  - DSCP値設定: Critical=46, High=34, Medium=18, Low=0
+  - Transit Gatewayでの優先制御
+  - DirectConnectでのQoS連携
+- **帯域保証**:
+  - Critical: 最低20%保証
+  - High: 最低15%保証
+  - Medium: 最低10%保証
+  - Low: ベストエフォート
+
+**Traffic Shaping実装**:
+- **Token Bucketアルゴリズム**:
+  - バケットサイズ: 10,000トークン
+  - 補充レート: 1,000トークン/秒
+  - バースト許容: 2倍まで
+- **API Gateway統合**:
+  - Usage Plan: Bronze/Silver/Gold
+  - スロットリング: 段階的制限
+
+### 8.3 データベース接続最適化
+
+#### 8.3.1 Aurora Connection Optimization
+```
+database-connection-optimization
+├── Aurora Proxy統合:
+│   ├── Connection Pooling: 効率的接続管理
+│   ├── 20個Aurora Cluster対応
+│   ├── Read/Write分離: 負荷分散
+│   └── Failover: 透明な障害対応
+├── Connection Management:
+│   ├── Pool Size: アプリケーション別最適化
+│   ├── Idle Time: 接続タイムアウト設定
+│   ├── Health Check: 接続ヘルスチェック
+│   └── Retry Logic: 接続失敗時のリトライ
+├── Query Optimization:
+│   ├── Prepared Statements: 実行計画再利用
+│   ├── Batch Processing: バッチクエリ最適化
+│   ├── Index Strategy: インデックス最適化
+│   └── Query Cache: クエリ結果キャッシュ
+└── Monitoring:
+    ├── Performance Insights: クエリ性能分析
+    ├── Slow Query Log: 低速クエリ特定
+    ├── Connection Metrics: 接続状態監視
+    └── Resource Utilization: リソース使用率
+```
+
+**Aurora Proxy詳細設定**:
+- **接続プール設計**:
+  - 初期サイズ: vCPU数 × 2
+  - 最大サイズ: vCPU数 × 4
+  - 接続タイムアウト: 300秒
+  - 検証クエリ: SELECT 1
+- **パフォーマンス改善**:
+  - 接続確立時間: 90%削減
+  - メモリ使用量: 60%削減
+  - 同時接続数: 10倍に拡張可能
+
+**Query最適化実装**:
+- **Prepared Statement効果**:
+  - パース時間: 95%削減
+  - 実行計画キャッシュ: 100%ヒット率
+  - メモリ効率: 50%改善
+- **バッチ処理最適化**:
+  - INSERT: 1000行単位でバッチ化
+  - UPDATE: WHERE IN句で一括更新
+  - ネットワークラウンドトリップ: 99%削減
+
+## 9. 統合ネットワーク監視・可視化（完全版）
+
+### 9.1 VPC Flow Logs統合分析
+
+#### 9.1.1 Flow Logs統合監視
+```
+vpc-flow-logs-integration
+├── ログ収集範囲:
+│   ├── 120アカウント全VPC
+│   ├── Transit Gateway Flow Logs
+│   ├── VPC Endpoint Flow Logs
+│   └── DirectConnect/VPN Flow Logs
+├── ストレージ戦略:
+│   ├── S3 Storage: s3://technova-network-logs-prod/
+│   ├── Partition: account-id/vpc-id/year/month/day/hour
+│   ├── Compression: Gzip圧縮
+│   └── Lifecycle: 90日後Glacier移行
+├── 分析基盤:
+│   ├── Amazon OpenSearch: リアルタイム検索
+│   ├── Amazon Athena: SQL分析
+│   ├── Amazon QuickSight: 可視化ダッシュボード
+│   └── Custom Analytics: Lambda関数処理
+└── 異常検知:
+    ├── ML-based Detection: 異常通信パターン
+    ├── Threshold Alerts: 帯域・接続数アラート
+    ├── Security Anomalies: セキュリティ異常
+    └── Performance Degradation: 性能劣化検知
+```
+
+**ログ収集設定詳細**:
+- **Flow Logsフォーマット**:
+  - カスタムフォーマット使用
+  - 含まれるフィールド: 全59フィールド
+  - 追加メタデータ: インスタンスID、サブネットID
+- **収集頻度**: 
+  - 本番環境: 1分間隔
+  - 開発環境: 10分間隔
+  - コスト最適化: $50,000/月
+
+**分析基盤実装**:
+- **OpenSearch設定**:
+  - インスタンス: r5.2xlarge.search × 6
+  - ストレージ: 30TB（30日分）
+  - インデックス戦略: 日次ローテーション
+- **Athenaパーティション**:
+  - 自動パーティション: AWS Glue使用
+  - クエリ最適化: Parquet変換
+  - コスト: $5/TB スキャン
+
+**異常検知アルゴリズム**:
+- **ML検知モデル**:
+  - アルゴリズム: Isolation Forest
+  - 学習期間: 30日間の正常データ
+  - 更新頻度: 週次再学習
+- **検知例**:
+  - ポートスキャン: 5分で100ポート以上
+  - DDoS: 通常の100倍のトラフィック
+  - データ流出: 1時間で1GB以上の外部転送
+
+### 9.2 gRPC通信監視（Service Connect統合）
+
+#### 9.2.1 Service Connect監視統合
+```
+grpc-monitoring-integration
+├── メトリクス収集:
+│   ├── Request Rate: リクエスト/秒
+│   ├── Response Time: P50, P90, P99レイテンシ
+│   ├── Error Rate: エラー率
+│   └── Throughput: スループット
+├── Service Map自動生成:
+│   ├── サービス間依存関係
+│   ├── 通信フロー可視化
+│   ├── 障害影響範囲特定
+│   └── パフォーマンスボトルネック特定
+├── Health Check統合:
+│   ├── gRPC Health Check Protocol
+│   ├── Custom Health Endpoints
+│   ├── Circuit Breaker状態監視
+│   └── Failover Detection
+└── Alerting:
+    ├── SLA Breach: SLA違反アラート
+    ├── High Error Rate: エラー率上昇
+    ├── Circuit Breaker Open: 回路断検知
+    └── Performance Degradation: 性能劣化
+```
+
+**メトリクス詳細設定**:
+- **収集方法**: 
+  - Envoy Proxy統計情報
+  - カスタムメトリクス: StatsD
+  - サンプリングレート: 10%
+- **保存期間**:
+  - 高解像度（1分）: 7日間
+  - 低解像度（1時間）: 13ヶ月
+  - コスト: $0.30/メトリクス/月
+
+**Service Map生成**:
+- **自動検出**: 
+  - Service Connect統合
+  - X-Rayトレース分析
+  - 15分ごとに更新
+- **可視化機能**:
+  - レイテンシヒートマップ
+  - エラー率の色分け表示
+  - トラフィック量の線の太さ
+
+### 9.3 X-Ray分散トレーシング
+
+#### 9.3.1 End-to-End Tracing
+```
+distributed-tracing-xray
+├── Trace Coverage:
+│   ├── 全20マイクロサービス
+│   ├── クロスアカウント通信
+│   ├── Aurora Database Calls
+│   └── 外部API呼び出し
+├── Service Map:
+│   ├── Visual Service Dependencies
+│   ├── Response Time Distribution
+│   ├── Error Propagation Analysis
+│   └── Performance Bottleneck Identification
+├── Trace Analysis:
+│   ├── Request Flow Visualization
+│   ├── Latency Breakdown Analysis
+│   ├── Error Root Cause Analysis
+│   └── Performance Regression Detection
+└── Integration:
+    ├── CloudWatch Metrics連携
+    ├── Service Connect統合
+    ├── Custom Application Metrics
+    └── Business KPI Correlation
+```
+
+**トレース実装詳細**:
+- **サンプリング戦略**:
+  - 本番: 5%（エラーは100%）
+  - ステージング: 50%
+  - 開発: 100%
+- **セグメント情報**:
+  - HTTPメタデータ
+  - SQLクエリ（サニタイズ済）
+  - カスタムアノテーション
+
+**パフォーマンス分析**:
+- **ボトルネック検出**:
+  - 閾値: 全体の50%以上の時間
+  - 自動通知: Slack/PagerDuty
+  - 改善提案: AIによる最適化案
+- **トレンド分析**:
+  - 日次比較: 性能劣化検出
+  - リリース影響: デプロイ前後比較
+
+### 9.4 統合監視ダッシュボード
+
+#### 9.4.1 Unified Monitoring Dashboard
+```
+unified-monitoring-dashboard
+├── Network Overview:
+│   ├── 120アカウント接続状況
+│   ├── Transit Gateway通信量
+│   ├── DirectConnect/VPN状態
+│   └── DNS解決状況
+├── Service Health:
+│   ├── 20マイクロサービス状態
+│   ├── gRPC通信品質
+│   ├── Database接続状況
+│   └── API応答性能
+├── Security Status:
+│   ├── セキュリティイベント
+│   ├── 異常通信検知
+│   ├── アクセス制御状況
+│   └── コンプライアンス状況
+├── Performance Metrics:
+│   ├── End-to-End Latency
+│   ├── Throughput Trends
+│   ├── Resource Utilization
+│   └── Cost Analysis
+└── Business KPIs:
+    ├── Transaction Success Rate
+    ├── User Experience Metrics
+    ├── Service Availability
+    └── Business Impact Analysis
+```
+
+**ダッシュボード実装**:
+- **技術スタック**:
+  - フロントエンド: React + D3.js
+  - バックエンド: GraphQL API
+  - データソース: CloudWatch, OpenSearch
+- **更新頻度**:
+  - リアルタイム: WebSocket使用
+  - ヒストリカル: 5分ごと更新
+- **カスタマイズ**:
+  - 部門別ビュー
+  - 役職別ダッシュボード
+  - アラート設定のパーソナライズ
+
+**Business KPI統合**:
+- **相関分析**:
+  - 技術メトリクス → ビジネス影響
+  - 例: レイテンシ100ms増加 → 売上0.5%減少
+- **予測分析**:
+  - 機械学習モデル: Prophet
+  - 予測期間: 7日先まで
+  - 精度: 85%以上
+
+## 10. 災害対策・マルチリージョン（完全統合）
+
+### 10.1 東京-大阪リージョン間DR設計
+
+#### 10.1.1 Multi-Region DR Architecture
+```
+disaster-recovery-architecture
+├── Primary Region (東京):
+│   ├── 全120アカウント本番環境
+│   ├── Transit Gateway: tgw-technova-tokyo
+│   ├── DirectConnect: 2Gbps × 2
+│   └── Full Service Deployment
+├── DR Region (大阪):
+│   ├── Critical Services DR環境
+│   ├── Transit Gateway: tgw-technova-osaka
+│   ├── DirectConnect: 1Gbps × 2
+│   └── Standby Configuration
+├── Cross-Region Connectivity:
+│   ├── VPC Peering: 東京 ↔ 大阪
+│   ├── Transit Gateway Peering
+│   ├── Data Replication Channels
+│   └── DNS Failover Configuration
+└── Failover Automation:
+    ├── Health Check Monitoring
+    ├── Automatic DNS Switching
+    ├── Service Startup Automation
+    └── Data Consistency Verification
+```
+
+**DR戦略詳細**:
+- **RTO/RPO目標**:
+  - RTO: 4時間（全サービス復旧）
+  - RPO: 1時間（データ損失）
+  - 測定: 四半期ごとのDRテスト
+- **コスト最適化**:
+  - 平常時: 本番の20%のリソース
+  - DR時: オートスケーリングで100%
+  - 月額コスト: 約500万円
+
+**Cross-Region設定**:
+- **Transit Gateway Peering**:
+  - 帯域: 5Gbps
+  - レイテンシ: 10ms（東京-大阪）
+  - 暗号化: AES-256
+- **データレプリケーション**:
+  - Aurora Global: 1秒以内
+  - S3 Cross-Region: 15分以内
+  - EBS Snapshots: 1時間ごと
+
+### 10.2 Aurora Global Database DR
+
+#### 10.2.1 Database DR Configuration
+```
+aurora-global-dr
+├── Global Database Setup:
+│   ├── Primary Cluster: 東京リージョン
+│   ├── Secondary Cluster: 大阪リージョン
+│   ├── Replication Lag: <1秒
+│   └── Read Replica: 両リージョン配置
+├── Failover Process:
+│   ├── Detection: Health Check失敗
+│   ├── Decision: 自動/手動切り替え
+│   ├── Promotion: Secondary→Primary昇格
+│   └── DNS Update: エンドポイント切り替え
+├── Data Consistency:
+│   ├── Transaction Log同期
+│   ├── Point-in-Time Recovery
+│   ├── Backup Verification
+│   └── Integrity Check
+└── Recovery Testing:
+    ├── Monthly DR Drill
+    ├── RTO/RPO Verification
+    ├── Application Compatibility
+    └── Performance Validation
+```
+
+**Global Database詳細設定**:
+- **クラスター構成**:
+  - Primaryインスタンス: db.r5.8xlarge × 3
+  - Secondaryインスタンス: db.r5.4xlarge × 2
+  - ストレージ: 最大128TB
+- **レプリケーション**:
+  - 専用ネットワーク使用
+  - 物理レプリケーション
+  - 自動バックプレッシャー制御
+
+**フェイルオーバー手順**:
+1. **検出フェーズ** (1-2分):
+   - ヘルスチェック失敗検出
+   - 管理者への通知
+2. **判定フェーズ** (5-10分):
+   - 自動/手動の判定
+   - ビジネス影響評価
+3. **実行フェーズ** (10-15分):
+   - Secondary昇格
+   - アプリケーション再接続
+4. **検証フェーズ** (30-60分):
+   - データ整合性確認
+   - パフォーマンステスト
+
+### 10.3 Route 53 DNS Failover
+
+#### 10.3.1 DNS-based Failover
+```
+route53-failover
+├── Health Check Configuration:
+│   ├── Primary Endpoints: 東京リージョン
+│   ├── Check Interval: 30秒
+│   ├── Failure Threshold: 3回連続失敗
+│   └── Recovery Threshold: 2回連続成功
+├── Failover Records:
+│   ├── Primary: technova.com → 東京ALB
+│   ├── Secondary: technova.com → 大阪ALB
+│   ├── TTL: 60秒（高速切り替え）
+│   └── Health Check Association
+├── Application-Level Failover:
+│   ├── api.technova.com → API Gateway
+│   ├── portal.technova.com → CloudFront
+│   ├── *.technova.internal → Internal Services
+│   └── Database Endpoints → Aurora Global
+└── Monitoring & Alerting:
+    ├── Health Check Status
+    ├── DNS Resolution Monitoring
+    ├── Failover Event Notification
+    └── Recovery Status Tracking
+```
+
+**Health Check詳細設定**:
+- **チェック方法**:
+  - HTTPS GET /health
+  - 期待するレスポンス: 200 OK
+  - タイムアウト: 4秒
+- **チェックロケーション**:
+  - 15リージョンから実施
+  - 過半数（8/15）で判定
+- **カスケード構成**:
+  - 親: ALBヘルスチェック
+  - 子: 個別サービスチェック
+
+**DNS切り替え動作**:
+- **通常時**: 
+  - 東京ALB: 100%トラフィック
+  - 大阪ALB: 0%（スタンバイ）
+- **障害時**:
+  - 検出: 1.5分（30秒×3回）
+  - 切替: 1分（TTL 60秒）
+  - 合計: 2.5分でフェイルオーバー完了
+
+**この完全統合版により、TechNova社は120アカウント構成での包括的なネットワーク基盤を実現できます。**
